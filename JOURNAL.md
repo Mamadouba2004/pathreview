@@ -97,3 +97,64 @@ estimate is wrong and I'd reassess in Week 8 — not at PR time.
    normalization over the full candidate pool — against the project's existing
    patterns in `rag/`.
 3. Write `PLAN.md` documenting the chosen approach and its trade-offs.
+
+---
+
+## Week 8 — Reproduction & solution planning
+
+**Reproduction commit link:**
+[`eaf271f` — test(rag): reproduce issue #24 hybrid retriever keyword over-weighting](https://github.com/Mamadouba2004/pathreview/commit/eaf271f)
+
+**Reproduction summary:**
+
+I reproduced the issue by driving the real `HybridRetriever.retrieve()` against
+the real `KeywordSearcher` (actual BM25 scoring) and a fake `VectorStore` that
+mirrors `VectorStore.query()`'s `1 / (1 + distance)` similarity conversion, over
+a corpus of one resume plus one unrelated project README. Querying `"React"`
+ranks `create-react-app` boilerplate first at a blended score of **0.9490**,
+ahead of the resume line that actually describes React work at **0.8636** —
+confirming the issue is real and locating it in the blending block of
+`rag/retriever/hybrid.py`.
+
+The measurement also corrected my Week 7 assumption about the cause. It isn't the
+weight ratio. Vector similarities cluster in **0.4082 – 0.5618**, so dividing by
+their own maximum leaves the vector signal spanning only ~27% of 0–1, while BM25
+starts at 0 and always spans the full range. Multiplying each family's usable
+spread by its weight gives vector `0.7 × 0.27 ≈ 0.191` against keyword
+`0.3 × 1.00 = 0.300` — **the keyword term controls ~61% of the ranking at a
+nominal 30% weight.** The per-retriever max-normalization is the bug, not the
+constants.
+
+The new test file `tests/unit/test_hybrid_retriever.py` holds three tests. Two
+pass today and pin down the mechanism (the differing dynamic ranges, and a
+keyword-only chunk clearing `min_score` on keyword weight alone). The third,
+`test_technology_name_query_ranks_relevant_chunk_first`, fails by design and is
+the red half of the cycle — it should go green in Week 9 without weakening its
+assertion.
+
+**PLAN.md link:**
+[PLAN.md on the working branch](https://github.com/Mamadouba2004/pathreview/blob/fix/24-hybrid-retriever-keyword-overweight/PLAN.md)
+(added in [`b8a47a0`](https://github.com/Mamadouba2004/pathreview/commit/b8a47a0))
+
+**Walkthrough video (recommended):** not recorded.
+
+**Blockers or open questions:**
+
+1. **`_get_all_chunks()` appears to be dead code, and I don't understand why
+   yet.** In `retrieve()` its return value is assigned to `all_chunks` and then
+   never used, and `self.keyword_searcher.search()` is called without the
+   searcher being indexed anywhere in that method. `KeywordSearcher.search()`
+   returns `[]` on an unindexed instance, so either `index()` is called from
+   somewhere in the ingestion path I haven't traced, or keyword search silently
+   contributes nothing in production — in which case the production symptom
+   differs from my reproduction. Tracing the callers of
+   `KeywordSearcher.index()` is my first Week 9 task, and it could change the
+   fix.
+2. **Whether Reciprocal Rank Fusion is the right call for this project.** RRF
+   discards score magnitude by design. If anything downstream reads
+   `vector_score` / `keyword_score` as raw similarities, rank-derived values
+   would be misleading. I've searched for the class name but not yet for those
+   dict keys across `api/`, `rag/`, and `frontend/src/`.
+3. **No local `make run` verification yet.** The reproduction is a unit-level
+   harness, not the full stack, so I have not yet observed the wrong chunk
+   surfacing in an actual generated review.
