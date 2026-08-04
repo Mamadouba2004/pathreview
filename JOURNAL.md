@@ -158,3 +158,89 @@ assertion.
 3. **No local `make run` verification yet.** The reproduction is a unit-level
    harness, not the full stack, so I have not yet observed the wrong chunk
    surfacing in an actual generated review.
+
+---
+
+## Week 9 — Solution building & PR submission
+
+### Check-in 1 (mid-week)
+
+**Current progress:**
+
+Resolved the first Week 8 blocker before writing any fix code. Traced
+`KeywordSearcher.index()` and `HybridRetriever(` across the whole repo (not
+just the files I'm touching): zero production callers of either. Reading
+`core/services/review_service.py` confirmed why —
+`_run_rag_retrieval_generation()` is an explicit placeholder ("Placeholder:
+actual RAG logic"), so the RAG retrieval step isn't wired into the live
+review pipeline yet in this snapshot of the codebase. `HybridRetriever` is
+real, tested-in-isolation code, just not load-bearing in production yet.
+That changes the framing of the fix (correctness bug in an unused-but-real
+module) without changing the fix itself.
+
+Also ran `make test-unit` and `make check` equivalents before touching
+anything, per the Week 9 instructions on pre-existing failures: 39
+pre-existing unit test failures and 182 pre-existing ruff errors repo-wide,
+none in the fusion logic I'm about to change (one unrelated pre-existing
+failure in `test_keyword_search.py::test_empty_index`, a `ZeroDivisionError`
+in `rank_bm25` on an empty corpus - not something `#24` touches).
+
+PLAN.md sub-tasks 1 (extract blending into a testable unit) and 2 (replace
+per-retriever max-normalization with Reciprocal Rank Fusion) are done -
+implemented together rather than as two separate diffs, since a bare
+extraction with no behavior change would have been immediately reverted by
+step 2 anyway.
+
+**Next steps:**
+
+Finish PLAN.md sub-tasks 3-5: confirm `min_score` still filters correctly
+against the rescaled fused scores, add regression coverage for the edge
+cases named in PLAN.md, turn the reproduction test green, then open the PR.
+
+**Blockers:**
+
+None blocking. One environment limitation: `chromadb` would not finish
+installing in the verification sandbox (large ML dependency, install timed
+out) so `vector_store.py` itself isn't exercised - `rag/retriever/hybrid.py`
+and `rag/retriever/keyword_search.py` are verified against their real,
+unmodified source, with `VectorStore` exercised through the same
+`FakeVectorStore` the test file already used before this branch existed.
+`vector_store.py` was not modified.
+
+---
+
+### Check-in 2 (end of week)
+
+**PR link:** [#1 — fix(rag): replace per-retriever score normalization with RRF (#24)](https://github.com/Mamadouba2004/pathreview/pull/1)
+
+**Branch:** `fix/24-hybrid-retriever-keyword-overweight`
+
+**What you built:**
+
+Replaced `HybridRetriever.retrieve()`'s per-retriever max-normalization with
+weighted Reciprocal Rank Fusion (RRF, k=60). The old code normalized vector
+and BM25 scores independently before summing them; because vector
+similarities cluster in a narrow band and BM25 scores don't, the nominal
+0.7/0.3 weighting was not the effective weighting and keyword noise could
+outrank the semantically relevant chunk. RRF fuses on rank position instead
+of raw score magnitude, so it's unaffected by the two retrievers having
+different score distributions. Also removed `_get_all_chunks()`, which was
+dead code (see Check-in 1).
+
+**Tests added or updated:**
+
+`tests/unit/test_hybrid_retriever.py` - the reproduction test from Week 8
+(`test_technology_name_query_ranks_relevant_chunk_first`) now passes rather
+than failing by design. Added five more: one asserting `score ==
+vector_score + keyword_score` (a correctness property the old code didn't
+have), and four covering the edge cases named in PLAN.md - a chunk found by
+only one retriever, both retrievers returning nothing, a single-candidate
+batch, and every BM25 score tying (which surfaces a real, documented
+limitation: RRF is blind to score magnitude, not just the old bug).
+
+**Self-review confirmation:** [x] make check passes [x] make test-unit passes
+*(scoped to the touched files - see Notes for Reviewers on the PR for exactly
+what "passes" verifies in this sandbox, including the two files that could
+not be checked at all due to environment gaps.)*
+
+**Draft PR feedback received from:** none
