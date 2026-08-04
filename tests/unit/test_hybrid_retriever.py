@@ -1,25 +1,28 @@
 """Tests for hybrid.py
 
-Reproduction for issue #24: the hybrid retriever over-weights keyword results
-when the query contains a technology name.
+Regression suite for issue #24 (hybrid retriever over-weights keyword
+results when the query contains a technology name).
 
-Root cause under test: HybridRetriever.retrieve normalizes each retriever's
-scores by the maximum score *within that retriever's own result set*. Vector
-similarities produced by VectorStore.query are 1/(1+distance), which clusters
-them into a narrow band, so max-normalization leaves the vector signal spanning
-only a fraction of 0-1. BM25 scores start at 0, so max-normalization always
-spreads the keyword signal across the full 0-1 range. The nominal 0.7/0.3
-weighting is therefore not the effective weighting, and keyword noise wins.
+Original root cause: HybridRetriever.retrieve normalized each retriever's
+scores by the maximum score *within that retriever's own result set* before
+summing them. Vector similarities from VectorStore.query (1/(1+distance))
+cluster in a narrow band, so normalizing them onto 0-1 left the vector
+signal spanning a fraction of the range, while BM25 scores start at 0 and
+always spanned the full range after normalization - so the nominal 0.7/0.3
+weighting was not the effective weighting, and keyword noise could outrank
+semantically relevant chunks.
 
-test_technology_name_query_ranks_relevant_chunk_first is EXPECTED TO FAIL until
-issue #24 is fixed. It is the red half of the red/green cycle.
+Fix: replace the per-retriever normalize-then-sum with weighted Reciprocal
+Rank Fusion (RRF), which consumes only each retriever's rank position and
+is therefore unaffected by the two retrievers having different score
+distributions. See rag/retriever/hybrid.py for the implementation and
+docs/PLAN.md (on this branch) for the full write-up.
 """
 
 import pytest
 
 from rag.retriever.hybrid import HybridRetriever
 from rag.retriever.keyword_search import KeywordSearcher
-
 
 # Two source documents for one profile: a resume, and the README of an
 # unrelated side project whose boilerplate repeats "React" many times.
@@ -88,7 +91,7 @@ DISTANCES = {
 
 
 class FakeCollection:
-    """Stands in for a ChromaDB collection for _get_all_chunks."""
+    """Stands in for a ChromaDB collection."""
 
     def get(self, include=None):
         return {
@@ -120,7 +123,7 @@ class FakeVectorStore:
 
 @pytest.mark.unit
 class TestHybridRetrieverKeywordOverWeighting:
-    """Reproduction suite for issue #24."""
+    """Regression suite for issue #24."""
 
     @pytest.fixture
     def searcher(self):
@@ -133,10 +136,12 @@ class TestHybridRetrieverKeywordOverWeighting:
         return HybridRetriever(FakeVectorStore(), searcher)
 
     def test_vector_scores_occupy_a_narrower_range_than_bm25_scores(self, searcher):
-        """Document the precondition: the two score families have different ranges.
+        """Documents why per-retriever normalization (the old approach) was fragile.
 
-        This is the mechanism behind issue #24 and it passes today - it asserts
-        what the code currently does, not what it should do.
+        This is the mechanism behind issue #24: normalizing each retriever's
+        scores independently before combining them is unsafe precisely
+        because their native ranges differ this much. It's why the fix uses
+        rank-based fusion instead of re-normalizing raw scores.
         """
         similarities = [1 / (1 + d) for d in DISTANCES.values()]
         vector_spread = (max(similarities) - min(similarities)) / max(similarities)
@@ -144,51 +149,163 @@ class TestHybridRetrieverKeywordOverWeighting:
         bm25 = [r["bm25_score"] for r in searcher.search("React", top_k=10)]
         keyword_spread = (max(bm25) - min(bm25)) / max(bm25)
 
-        # After per-retriever max-normalization the keyword signal spans the full
-        # 0-1 range while the vector signal spans well under half of it.
         assert keyword_spread == pytest.approx(1.0)
         assert vector_spread < 0.5
 
-    def test_keyword_only_chunk_clears_min_score_on_keyword_weight_alone(self, searcher):
-        """A chunk with no vector score at all still passes the quality floor.
+    def test_technology_name_query_ranks_relevant_chunk_first(self, retriever):
+        """The core regression test for issue #24.
 
-        A chunk absent from the vector result set gets vector_score = 0.0, so its
-        blended score is keyword_weight * keyword_score. The top keyword hit is
-        always normalized to 1.0, giving exactly keyword_weight (0.3), which meets
-        the default min_score of 0.3.
+        Querying a technology name must surface the resume line that
+        actually describes React work, not create-react-app boilerplate
+        from an unrelated project's README.
         """
-        retriever = HybridRetriever(FakeVectorStore(), searcher)
+        results = retriever.retrieve(query="React", profile_id="p1", query_embedding=[0.0] * 8)
+
+        assert results[0]["id"] == "resume-3", (
+            f"expected 'resume-3' at rank 1, got {results[0]['id']!r} "
+            f"(score={results[0]['score']:.4f})"
+        )
+
+    def test_score_equals_sum_of_vector_and_keyword_contributions(self, retriever):
+        """score, vector_score, and keyword_score are consistent with each other.
+
+        Under the old normalize-then-sum approach, the weights were baked
+        into `score` but not into the returned `vector_score` /
+        `keyword_score` fields, so a caller could not reconstruct `score`
+        from the two breakdown fields. The fused implementation applies
+        weights before normalizing, so the breakdown is directly additive.
+        """
+        results = retriever.retrieve(query="React", profile_id="p1", query_embedding=[0.0] * 8)
+
+        assert results, "expected at least one result"
+        for r in results:
+            assert r["score"] == pytest.approx(r["vector_score"] + r["keyword_score"])
+
+    def test_chunk_absent_from_one_retriever_gets_zero_from_it(self, searcher):
+        """Covers PLAN.md edge cases 1 and 2: a chunk found by only one retriever.
+
+        A chunk missing from the vector results must show vector_score == 0
+        (not be penalized further, not be assumed average); the mirror case
+        holds for a chunk missing from the keyword results. Both must still
+        appear in the final results - a single-retriever hit is a real
+        signal, just a partial one.
+        """
         top_keyword_id = searcher.search("React", top_k=10)[0]["id"]
 
-        # Restrict the vector store so the top keyword hit is not among its results.
         class NarrowVectorStore(FakeVectorStore):
+            """Vector store that never returns the top keyword hit."""
+
             def query(self, query_embedding, collection_name, n_results=10):
                 base = super().query(query_embedding, collection_name, n_results=99)
                 return [r for r in base if r["id"] != top_keyword_id][:n_results]
 
-        retriever.vector_store = NarrowVectorStore()
+        retriever = HybridRetriever(NarrowVectorStore(), searcher)
         results = retriever.retrieve(
             query="React", profile_id="p1", query_embedding=[0.0] * 8, max_chunks=10
         )
 
-        orphan = next(r for r in results if r["id"] == top_keyword_id)
-        assert orphan["vector_score"] == 0.0
-        assert orphan["score"] == pytest.approx(retriever.keyword_weight)
-        assert orphan["score"] >= 0.3  # clears the default min_score floor
+        keyword_only = next(r for r in results if r["id"] == top_keyword_id)
+        assert keyword_only["vector_score"] == 0.0
+        assert keyword_only["keyword_score"] > 0.0
 
-    def test_technology_name_query_ranks_relevant_chunk_first(self, retriever):
-        """EXPECTED TO FAIL until issue #24 is fixed.
+        # Mirror case: any chunk absent from the keyword results (every
+        # chunk in this corpus except the top-10 BM25 matches - here, all
+        # of them are indexed, so this checks the ones ranked outside the
+        # keyword searcher's own top_k window) must show keyword_score == 0.
+        keyword_result_ids = {r["id"] for r in searcher.search("React", top_k=10)}
+        vector_only_present = [r for r in results if r["id"] not in keyword_result_ids]
+        for r in vector_only_present:
+            assert r["keyword_score"] == 0.0
+            assert r["vector_score"] > 0.0
 
-        Querying a technology name should surface the resume line that actually
-        describes React work, not create-react-app boilerplate from an unrelated
-        project's README.
+    def test_empty_results_from_both_retrievers_returns_empty_list(self):
+        """Covers PLAN.md edge case 3: no candidates from either retriever.
+
+        Must return [] rather than raising (e.g. a ZeroDivisionError from
+        dividing by a max score computed over an empty set).
         """
+
+        class EmptyVectorStore(FakeVectorStore):
+            def query(self, query_embedding, collection_name, n_results=10):
+                return []
+
+        empty_searcher = KeywordSearcher()  # never indexed -> search() returns []
+        retriever = HybridRetriever(EmptyVectorStore(), empty_searcher)
+
+        results = retriever.retrieve(query="React", profile_id="p1", query_embedding=[0.0] * 8)
+
+        assert results == []
+
+    def test_single_candidate_does_not_raise_and_is_bounded(self):
+        """Covers PLAN.md edge case 5: exactly one candidate in the batch.
+
+        A lone candidate is trivially its own batch maximum, so it will
+        always normalize to score == 1.0 and pass any min_score - this
+        was true before the fix too. What the fix must guarantee is that
+        this case doesn't divide by zero or otherwise raise.
+        """
+        chunk = {"id": "only-one", "text": "irrelevant content", "metadata": {}}
+
+        class OneChunkVectorStore(FakeVectorStore):
+            def query(self, query_embedding, collection_name, n_results=10):
+                return [{**chunk, "score": 0.42}]
+
+        searcher = KeywordSearcher()
+        searcher.index([chunk])
+        retriever = HybridRetriever(OneChunkVectorStore(), searcher)
+
         results = retriever.retrieve(
-            query="React", profile_id="p1", query_embedding=[0.0] * 8
+            query="query terms not present in the chunk",
+            profile_id="p1",
+            query_embedding=[0.0] * 8,
         )
 
-        assert results[0]["id"] == "resume-3", (
-            "issue #24: keyword noise outranks the semantically relevant chunk. "
-            f"Got {results[0]['id']!r} at rank 1 "
-            f"(blended={results[0]['score']:.4f}); expected 'resume-3'."
+        assert len(results) == 1
+        assert 0.0 <= results[0]["score"] <= 1.0
+
+    def test_tied_bm25_scores_do_not_override_vector_ranking_at_default_weights(self):
+        """Covers PLAN.md edge case 4: every BM25 score ties (query term is
+        in every chunk, so BM25's IDF component collapses toward zero).
+
+        KeywordSearcher.search still returns top_k chunks in this case
+        (Python's sort is stable, so ties keep their original order) - RRF
+        consumes that position regardless of the tied score's magnitude.
+        At the default weights (vector_weight=0.7 > keyword_weight=0.3)
+        the dominant vector signal keeps the fused ranking aligned with the
+        vector-only ranking even when the keyword ranking is meaningless.
+
+        This is a real, acknowledged limitation of pure RRF - it is blind to
+        score magnitude - flagged in the PR as a residual risk rather than
+        silently assumed away.
+        """
+        tied_corpus = [
+            {"id": "a", "text": "python python python", "metadata": {}},
+            {"id": "b", "text": "python python python", "metadata": {}},
+            {"id": "c", "text": "python python python", "metadata": {}},
+        ]
+
+        class TiedVectorStore(FakeVectorStore):
+            def query(self, query_embedding, collection_name, n_results=10):
+                order = ["c", "b", "a"]
+                scores = {"c": 0.9, "b": 0.7, "a": 0.5}
+                return [
+                    {
+                        "id": cid,
+                        "text": next(x["text"] for x in tied_corpus if x["id"] == cid),
+                        "metadata": {},
+                        "score": scores[cid],
+                    }
+                    for cid in order
+                ][:n_results]
+
+        searcher = KeywordSearcher()
+        searcher.index(tied_corpus)
+        bm25_scores = {r["bm25_score"] for r in searcher.search("python", top_k=10)}
+        assert len(bm25_scores) == 1, "expected every BM25 score to tie for this corpus"
+
+        retriever = HybridRetriever(TiedVectorStore(), searcher)
+        results = retriever.retrieve(
+            query="python", profile_id="p1", query_embedding=[0.0] * 4, min_score=0.0
         )
+
+        assert [r["id"] for r in results] == ["c", "b", "a"]
