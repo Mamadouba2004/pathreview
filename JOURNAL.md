@@ -244,3 +244,36 @@ what "passes" verifies in this sandbox, including the two files that could
 not be checked at all due to environment gaps.)*
 
 **Draft PR feedback received from:** none
+
+---
+
+## Week 10 — Iteration & reflection
+
+### Reviewer feedback
+
+**Feedback received:** [ ] Yes &nbsp;&nbsp; [x] No — still awaiting review
+
+**Summary of feedback:**
+No reviewer feedback came in on [PR #1](https://github.com/Mamadouba2004/pathreview/pull/1). Per the Su26 course note, reviewer feedback isn't a live feature this term, so I'm not expecting a maintainer pass — I'm treating the self-review documented in the PR's "Notes for Reviewers" section as the review substitute for this cycle.
+
+**How you responded:**
+N/A — nothing to respond to. If this were a live repo, the three points I flagged for a reviewer myself (RRF's magnitude-blindness, the unwired `HybridRetriever`, the `_get_all_chunks()` deletion) are exactly where I'd expect pushback, and I already wrote out my reasoning for each rather than waiting to be asked.
+
+---
+
+### Reflection
+
+**What was harder than you expected?**
+Staying honest about verification under real environment gaps. My sandbox couldn't install `chromadb`, didn't have Python 3.11 (the repo's pinned version), and had no Docker/Postgres — so `make check` and `make test-unit` as literally specified were never runnable end to end. The harder discipline wasn't writing the fix, it was resisting the temptation to write "tests pass" and let that imply more than it should. I ended up writing a "how I verified, and the limits of my sandbox" section in the PR instead, which took longer than just claiming a clean run, but it's the only version that's actually true. The other thing that surprised me: my own Week 7 root-cause theory ("it's the weight ratio") turned out to be wrong once I actually measured it in Week 8. The issue's own description said "a fixed 50/50 weight," and I nearly built the fix around correcting that instead of the real bug, which was the per-retriever normalization.
+
+**What did you learn about working in a large codebase?**
+That you have to verify a change is safe before you make it, not after. Before I touched `HybridRetriever.__init__`'s signature I grepped the whole repo for callers — zero outside tests — which is also how I found that `_get_all_chunks()` was dead code and that the class isn't wired into `core/services/review_service.py` at all (`_run_rag_retrieval_generation()` is still a placeholder). That last fact changed how I framed the whole PR: this is a real, measurable bug, but not one currently touching live traffic, and saying that plainly is more useful to a reviewer than either overstating the urgency or hiding the caveat. In my own projects I've never had to reason about "who else calls this" before changing a function — here it was the first thing I did on every change.
+
+**How did AI tools help — and where did they fall short?**
+AI was strongest as a pairing partner for structure I already knew the shape of: turning "I need edge cases" into the actual matrix (one retriever silent, both silent, all-tied BM25, single candidate) faster than I'd have enumerated them alone, and helping draft the PR template sections so I could focus on getting the content right rather than the formatting. It fell short anywhere that required judgment I had to own: deciding RRF's magnitude-blindness was an acceptable trade-off for this codebase (not a fact to look up — a call to make and defend), and catching a subtle framing problem myself where an early draft of one test's expected score numerically resembled the old bug's forced output in a way that could have implied the fix changed nothing, when it hadn't actually failed — I had to notice that and reframe the assertion around the real invariant instead of a coincidental number. AI also can't run `chromadb` in an environment that won't install it; it can help you document that gap honestly, but it can't paper over it.
+
+**What would you do differently if you started over?**
+I'd hit the Python 3.11 / `chromadb` requirement in Week 7 setup instead of discovering the gap while trying to verify in Week 9 under deadline pressure — that would have given me time to either fix the environment or plan the lightweight-harness verification strategy from the start instead of assembling it last-minute. I'd also measure the score distributions (vector vs. BM25 dynamic range) in Week 7 rather than Week 8, since that's what actually overturned my root-cause assumption — catching it a week earlier would have meant PLAN.md was built on the right diagnosis from day one instead of course-correcting mid-flight. And I'd open the PR earlier in Week 9 rather than at the very end, per the course's own advice not to wait for the due date — I did most of the drafting right up against the deadline, which left no real window for the review cycle this week is nominally about.
+
+**What are you most proud of from this module?**
+Not the fix itself — the decision to put the "this bug is real but not currently live-traffic-affecting" caveat directly in the PR, right next to the fix, instead of either burying it or leaving it out to make the contribution look more consequential than it is. That's the kind of claim that's easy to shade in either direction, and I think getting it exactly right — measured, not oversold, not underclaimed — is closer to what a real maintainer would actually want from a contributor than a technically-correct fix with an inflated pitch around it.
